@@ -1,10 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import * as os from '@stabilitydao/stability/out/os';
-import {
-  IBuildersMemory,
-  IBuilderActivity,
-} from '@stabilitydao/stability/out/activity/builder';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import { App, Octokit } from 'octokit';
@@ -20,6 +17,9 @@ export class GithubService implements OnModuleInit {
   private message: string;
   private logger = new Logger(GithubService.name);
   private installationId: number;
+
+  private handleIssueIsRunning = false;
+  private fullSyncIsRunning = false;
 
   constructor(private config: ConfigService) {}
 
@@ -43,17 +43,18 @@ export class GithubService implements OnModuleInit {
 
     this.message = 'Good luck!';
 
-    // 🔍 Initialize installationId
     await this.resolveInstallationId();
-
-    // 🗂 Update local issues cache
     await this.updateIssues().catch((e) => this.logger.error(e));
 
-    // 🧩 Verify authentication
     const { data } = await this.app.octokit.request('/app');
     this.logger.log(
       `Authenticated as GitHub App '${data.name}' (id: ${data.id})`,
     );
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async hourlyFullSync() {
+    await this.fullIssuesUpdate();
   }
 
   private async resolveInstallationId() {
@@ -66,22 +67,26 @@ export class GithubService implements OnModuleInit {
 
     const { data: installations } =
       await this.app.octokit.rest.apps.listInstallations();
+
     if (!installations.length) {
-      throw new Error('❌ No installations found for this GitHub App.');
+      throw new Error('No installations found for GitHub App');
     }
 
     this.installationId = installations[0].id;
     this.logger.log(`Detected installation ID: ${this.installationId}`);
   }
 
-  /**
-   * Creates an Octokit instance for the installation
-   */
   private async getOctokit() {
     if (!this.installationId) {
       await this.resolveInstallationId();
     }
     return this.app.getInstallationOctokit(this.installationId);
+  }
+
+  private async waitForUnlock() {
+    while (this.handleIssueIsRunning || this.fullSyncIsRunning) {
+      await this.sleep(300);
+    }
   }
 
   async handlePROpened(payload: any) {
@@ -104,12 +109,12 @@ export class GithubService implements OnModuleInit {
   }
 
   async handleIssue(payload: any) {
+    await this.waitForUnlock();
+    this.handleIssueIsRunning = true;
+
     const { repository, action } = payload;
     const repoKey = `${repository.owner.login}/${repository.name}`;
-
-    this.logger.log(
-      `🔁 Issue event: ${action} in ${repoKey} — refreshing issues...`,
-    );
+    this.logger.log(`Issue event: ${action} in ${repoKey}`);
 
     try {
       const octokit = await this.getOctokit();
@@ -122,116 +127,66 @@ export class GithubService implements OnModuleInit {
       });
 
       this.issues[repoKey] = issues.map((i) => this.issueToDTO(i, repoKey));
-
-      this.logger.log(
-        `✅ Updated issues for ${repoKey} (${this.issues[repoKey].length} total)`,
-      );
     } catch (error: any) {
       this.logger.error(
-        `❌ Failed to refresh issues for ${repoKey}: ${error.response?.data?.message || error}`,
+        `Failed to refresh issues for ${repoKey}: ${error.response?.data?.message || error}`,
       );
+    } finally {
+      this.handleIssueIsRunning = false;
     }
   }
-  async syncLabels() {
-    const daos = os.daos;
-    for (const dao of daos) {
-      const builder = dao.builderActivity;
-      if (!builder) {
-        this.logger.error('Builder agent not found');
-        continue;
-      }
 
-      const labels = [
-        ...builder.pools.map((p) => p.label),
-        ...builder.conveyors.map((c) => c.label),
-      ];
+  private async fullIssuesUpdate() {
+    await this.waitForUnlock();
+    this.fullSyncIsRunning = true;
 
-      const uniqueLabels = Object.values(
-        Object.fromEntries(labels.map((l) => [l.name, l])),
-      );
-
-      const octokit = await this.getOctokit();
-
-      for (const repo of builder.repo) {
-        const [owner, repoName] = repo.split('/');
-        this.logger.log(`🔄 Syncing labels for ${repo}...`);
-
-        const { data: existing } = await octokit.rest.issues.listLabelsForRepo({
-          owner,
-          repo: repoName,
-          per_page: 100,
-        });
-
-        for (const label of uniqueLabels) {
-          const existingLabel = existing.find((l) => l.name === label.name);
-          const color = label.color.replace('#', '');
-
-          this.logger.log(`🔍 Checking ${label.name}`);
-
-          if (!existingLabel) {
-            this.logger.log(`➕ Creating ${label.name}`);
-            await octokit.rest.issues.createLabel({
-              owner,
-              repo: repoName,
-              name: label.name,
-              color,
-              description: label.description,
-            });
-          } else if (
-            existingLabel.color !== color ||
-            existingLabel.description !== label.description
-          ) {
-            this.logger.log(`✏️ Updating ${label.name}`);
-            await octokit.rest.issues.updateLabel({
-              owner,
-              repo: repoName,
-              name: label.name,
-              color,
-              description: label.description,
-            });
-          } else {
-            this.logger.log(`✅ ${label.name} is up to date`);
-          }
-        }
-      }
-      this.logger.log('✅ All labels synced successfully!');
+    try {
+      await this.updateIssues();
+      this.logger.log('Full issues update completed.');
+    } catch (error) {
+      this.logger.error(`Full issues update failed: ${error}`);
+    } finally {
+      this.fullSyncIsRunning = false;
     }
   }
 
   private async updateIssues() {
     const daos = os.daos;
+
     for (const dao of daos) {
       const builder = dao.builderActivity;
-      const repos = builder?.repo ?? [];
+      if (!builder) continue;
+
+      const repos = builder.repo ?? [];
       const octokit = await this.getOctokit();
 
       for (const repo of repos) {
         const [owner, repoName] = repo.split('/');
-        this.logger.log(`📥 Fetching issues for ${repo}...`);
-        const { data: issues } = await octokit.rest.issues.listForRepo({
-          owner,
-          repo: repoName,
-          per_page: 100,
-        });
+        this.logger.log(`Fetching issues for ${repo}...`);
 
-        this.issues[repo] = issues.map((i) => this.issueToDTO(i, repo));
+        try {
+          const { data: issues } = await octokit.rest.issues.listForRepo({
+            owner,
+            repo: repoName,
+            per_page: 100,
+          });
+
+          this.issues[repo] = issues.map((i) => this.issueToDTO(i, repo));
+        } catch (e) {
+          this.logger.error(`Failed to fetch issues for ${repo}`);
+        }
       }
     }
-
-    await this.updateIssues();
   }
 
-  getBuilderMemory(): IBuildersMemory {
+  getBuilderMemory() {
     const daos = os.daos;
-    const poolsMemory: IBuildersMemory = {};
+    const poolsMemory: any = {};
 
     for (const dao of daos) {
       poolsMemory[dao.tokenization.tokenSymbol] = {
         conveyors: {},
-        openIssues: {
-          pools: {},
-          total: {},
-        },
+        openIssues: { pools: {}, total: {} },
       };
 
       const agent = dao.builderActivity;
@@ -246,7 +201,6 @@ export class GithubService implements OnModuleInit {
           [];
 
         const issues = Object.values(this.issues).flat();
-
         const filtered = issues.filter((issue) =>
           issue.labels.some((l) => l.name === pool.label.name),
         );
@@ -256,14 +210,13 @@ export class GithubService implements OnModuleInit {
         ].push(...filtered);
       }
 
-      const conveyorsMemory: IBuildersMemory[string]['conveyors'] = {};
+      const conveyorsMemory: any = {};
       for (const conveyor of agent?.conveyors ?? []) {
         conveyorsMemory[conveyor.name] = {};
 
         for (const step of conveyor.steps) {
           for (const issue of step.issues) {
             const repoKey = issue.repo;
-
             const stored = this.issues[repoKey] || [];
 
             stored.forEach((i) => {
@@ -299,7 +252,6 @@ export class GithubService implements OnModuleInit {
 
   private extractIssueStep(title: string): string {
     const step = title.split(': ');
-
     return step[step.length - 1];
   }
 
@@ -309,7 +261,6 @@ export class GithubService implements OnModuleInit {
     taskIdIs: string,
   ): string | null {
     const escapedTemplate = template.replace(/([.*+?^${}()|[\]\\])/g, '\\$1');
-
     const regexPattern = escapedTemplate.replace(
       /%([A-Z0-9_]+)%/g,
       (_, varName) => `(?<${varName}>.+?)`,
@@ -346,5 +297,9 @@ export class GithubService implements OnModuleInit {
       body: issue.body ?? '',
       repo,
     };
+  }
+
+  private sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
