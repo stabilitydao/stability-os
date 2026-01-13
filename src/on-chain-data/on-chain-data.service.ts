@@ -12,7 +12,7 @@ export class OnChainDataService {
   private logger = new Logger(OnChainDataService.name);
   constructor(private readonly daoFactory: DaoFactory) {}
 
-  @Cron(CronExpression.EVERY_HOUR)
+  @Cron(CronExpression.EVERY_5_MINUTES)
   async handleUpdateOnChainData() {
     await this.updateOnChainData();
   }
